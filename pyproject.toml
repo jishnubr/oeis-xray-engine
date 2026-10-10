@@ -1,0 +1,23 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "oeis-xray-engine"
+version = "0.1.0"
+description = "Standalone engine for provenance-backed OEIS sequence exploration"
+readme = "README.md"
+requires-python = ">=3.10"
+dependencies = [
+    "mpmath>=1.1.0",
+    "numpy>=1.18.1",
+]
+
+[project.scripts]
+oeis-xray = "oeis_xray_engine.cli:main"
+
+[tool.setuptools.packages.find]
+include = ["oeis_xray_engine*"]
+
+[tool.setuptools.package-data]
+oeis_xray_engine = ["storage/schema.sql"]
