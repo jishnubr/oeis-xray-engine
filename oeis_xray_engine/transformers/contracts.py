@@ -111,3 +111,4 @@ class TransformerContract(ABC):
     @abstractmethod
     def transform(self, context: TransformerExecutionContext) -> TransformerResult:
         """Compute an exact finite transform without performing I/O."""
+

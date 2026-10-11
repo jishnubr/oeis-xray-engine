@@ -14,6 +14,7 @@ import os
 import socket
 import sys
 import threading
+import time
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Sequence, cast
@@ -149,6 +150,14 @@ def _build_parser() -> argparse.ArgumentParser:
         "--run-id",
         help="run identifier (default: generated UUID)",
     )
+    plan.add_argument(
+        "--start-id",
+        help="inclusive lower bound OEIS sequence ID, e.g. A000001",
+    )
+    plan.add_argument(
+        "--end-id",
+        help="inclusive upper bound OEIS sequence ID, e.g. A010000",
+    )
 
     run = commands.add_parser("run", help="execute pending planned tasks")
     _add_command_options(run)
@@ -187,6 +196,75 @@ def _build_parser() -> argparse.ArgumentParser:
         default="markdown",
         help="export format (default: markdown)",
     )
+
+    sweep = commands.add_parser(
+        "sweep",
+        help=(
+            "orchestrate a full plan-run-report-export lifecycle across "
+            "auto-sliced OEIS sequence ranges"
+        ),
+    )
+    _add_command_options(sweep)
+    sweep.add_argument("--snapshot", required=True, help="ready snapshot identifier")
+    sweep.add_argument(
+        "--sweep-type",
+        choices=("inverse-euler", "denumerant"),
+        default="inverse-euler",
+        help="transform sweep type (default: inverse-euler)",
+    )
+    sweep.add_argument(
+        "--start-id",
+        default="A000001",
+        help="inclusive lower bound OEIS sequence ID (default: A000001)",
+    )
+    sweep.add_argument(
+        "--end-id",
+        default="A399999",
+        help="inclusive upper bound OEIS sequence ID (default: A399999)",
+    )
+    sweep.add_argument(
+        "--slice-size",
+        type=_positive_integer,
+        default=10000,
+        help="number of sequences per slice (default: 10000)",
+    )
+    sweep.add_argument(
+        "--max-terms",
+        type=_positive_integer,
+        default=32,
+        help="bounded transform/fingerprint term count (default: 32)",
+    )
+    sweep.add_argument(
+        "--workers",
+        type=_positive_integer,
+        default=_default_workers(),
+        help=f"worker process count (default: {_default_workers()})",
+    )
+    sweep.add_argument(
+        "--resume",
+        action="store_true",
+        help="skip slices whose run IDs already exist and are complete",
+    )
+    sweep.add_argument(
+        "--run-prefix",
+        default=None,
+        help=(
+            "prefix for generated run IDs (default: <sweep_type>-sweep); "
+            "each slice gets <prefix>-ANNNNNN-ANNNNNN"
+        ),
+    )
+    sweep.add_argument(
+        "--export-format",
+        choices=("json", "markdown"),
+        default="markdown",
+        help="gem export format (default: markdown)",
+    )
+    sweep.add_argument(
+        "--export-file",
+        type=Path,
+        default=None,
+        help="file path for aggregated gem export (default: stdout)",
+    )
     return parser
 
 
@@ -221,6 +299,8 @@ def _make_pipeline_spec(
     *,
     sweep: str = "inverse-euler",
     ramanujan_search_specs: tuple[CFSearchSpec, ...] = (),
+    start_sequence_id: str | None = None,
+    end_sequence_id: str | None = None,
 ) -> PipelineSpec:
     transform_specs: tuple[TransformSpec, ...] = ()
     if "transform" in stages:
@@ -279,6 +359,8 @@ def _make_pipeline_spec(
         transform_specs=transform_specs,
         fingerprint_profiles=profiles,
         ramanujan_search_specs=ramanujan_search_specs,
+        start_sequence_id=start_sequence_id,
+        end_sequence_id=end_sequence_id,
     )
 
 
@@ -435,6 +517,246 @@ def _run_pipeline(
     return result
 
 
+def _generate_slices(
+    start_id: str,
+    end_id: str,
+    slice_size: int,
+) -> list[tuple[str, str]]:
+    """Split a contiguous OEIS ID range into fixed-size slices.
+
+    Each slice is a ``(start, end)`` pair of inclusive A-numbers.
+    The final slice may be shorter if the range is not evenly divisible.
+    """
+
+    def _parse_anum(anum: str) -> int:
+        cleaned = anum.strip().upper()
+        if not cleaned.startswith("A"):
+            raise ValueError(f"Invalid OEIS ID: {anum!r}")
+        return int(cleaned[1:])
+
+    def _format_anum(number: int) -> str:
+        return f"A{number:06d}"
+
+    lo = _parse_anum(start_id)
+    hi = _parse_anum(end_id)
+    if lo > hi:
+        raise ValueError(
+            f"start_id {start_id} is greater than end_id {end_id}"
+        )
+    slices: list[tuple[str, str]] = []
+    cursor = lo
+    while cursor <= hi:
+        slice_end = min(cursor + slice_size - 1, hi)
+        slices.append((_format_anum(cursor), _format_anum(slice_end)))
+        cursor = slice_end + 1
+    return slices
+
+
+def _run_id_exists(catalog: Catalog, run_id: str) -> str | None:
+    """Return the run state if the run_id exists, else None."""
+    try:
+        store = CheckpointStore(catalog)
+        run = store.get_run(run_id)
+        return str(run["state"])
+    except Exception:
+        return None
+
+
+def _cmd_sweep(
+    args: argparse.Namespace,
+    catalog: Catalog,
+    term_store: TermStore,
+) -> int:
+    """Orchestrate the full plan-run-report-export lifecycle across auto-sliced
+    OEIS sequence ranges.
+
+    For each slice the command runs:
+      1. ``plan`` — create bounded, deterministic tasks
+      2. ``run`` — execute tasks with multiprocess workers
+      3. ``report`` — log a summary of completed/errored tasks and claims
+
+    After all slices finish, an aggregated gem export is written.
+    """
+
+    sweep_type: str = args.sweep_type
+    snapshot: str = args.snapshot
+    max_terms: int = args.max_terms
+    workers: int = args.workers
+    resume_mode: bool = args.resume
+    prefix = args.run_prefix or f"{sweep_type}-sweep"
+    export_format: str = args.export_format
+    export_path: Path | None = args.export_file
+
+    slices = _generate_slices(args.start_id, args.end_id, args.slice_size)
+    total_slices = len(slices)
+
+    _LOGGER.info(
+        "=== SWEEP START === %s | %s -> %s | %d slice(s) of %d | %d workers",
+        sweep_type,
+        args.start_id,
+        args.end_id,
+        total_slices,
+        args.slice_size,
+        workers,
+    )
+
+    coordinator = PipelineCoordinator(catalog, term_store)
+    stages = _default_stages_for_sweep(sweep_type)
+    completed_run_ids: list[str] = []
+    sweep_start = time.monotonic()
+    interrupted = False
+
+    for idx, (slice_start, slice_end) in enumerate(slices, 1):
+        run_id = f"{prefix}-{slice_start}-{slice_end}"
+        _LOGGER.info(
+            "\n%s\n  SLICE %d/%d: %s -> %s  (run: %s)\n%s",
+            "=" * 60,
+            idx,
+            total_slices,
+            slice_start,
+            slice_end,
+            run_id,
+            "=" * 60,
+        )
+
+        # ---- Check for existing run (resume mode) ----
+        existing_state = _run_id_exists(catalog, run_id)
+        if existing_state is not None:
+            if existing_state == "complete" and resume_mode:
+                _LOGGER.info(
+                    "  SKIP slice %d/%d — run %s already complete.",
+                    idx,
+                    total_slices,
+                    run_id,
+                )
+                completed_run_ids.append(run_id)
+                continue
+            if existing_state in ("paused", "running") and resume_mode:
+                _LOGGER.info(
+                    "  RESUME slice %d/%d — run %s was %s.",
+                    idx,
+                    total_slices,
+                    run_id,
+                    existing_state,
+                )
+                try:
+                    result = _run_pipeline(
+                        coordinator, run_id, workers, resume=True
+                    )
+                except KeyboardInterrupt:
+                    _LOGGER.warning(
+                        "Sweep interrupted at slice %d/%d.", idx, total_slices
+                    )
+                    interrupted = True
+                    break
+                _print_report(run_id, catalog)
+                if result.state == "complete":
+                    completed_run_ids.append(run_id)
+                continue
+            if not resume_mode:
+                _LOGGER.error(
+                    "  Run %s already exists (state: %s). "
+                    "Use --resume to skip/continue existing runs.",
+                    run_id,
+                    existing_state,
+                )
+                return 1
+
+        # ---- Phase 1: Plan ----
+        slice_start_time = time.monotonic()
+        _LOGGER.info("  [1/3] Planning %s...", run_id)
+        spec = _make_pipeline_spec(
+            run_id,
+            snapshot,
+            max_terms,
+            stages,
+            sweep=sweep_type,
+            start_sequence_id=slice_start,
+            end_sequence_id=slice_end,
+        )
+        coordinator.plan(spec)
+        plan_elapsed = time.monotonic() - slice_start_time
+        _LOGGER.info("  [1/3] Planned in %.1fs.", plan_elapsed)
+
+        # ---- Phase 2: Run ----
+        _LOGGER.info("  [2/3] Executing %s with %d workers...", run_id, workers)
+        try:
+            result = _run_pipeline(
+                coordinator, run_id, workers, resume=False
+            )
+        except KeyboardInterrupt:
+            _LOGGER.warning(
+                "Sweep interrupted during execution at slice %d/%d.",
+                idx,
+                total_slices,
+            )
+            interrupted = True
+            break
+        run_elapsed = time.monotonic() - slice_start_time
+        _LOGGER.info(
+            "  [2/3] Executed in %.1fs — state: %s, completed: %d.",
+            run_elapsed,
+            result.state,
+            result.newly_completed,
+        )
+
+        # ---- Phase 3: Report ----
+        _LOGGER.info("  [3/3] Report for %s:", run_id)
+        _print_report(run_id, catalog)
+
+        if result.state == "complete":
+            completed_run_ids.append(run_id)
+        else:
+            _LOGGER.warning(
+                "  Slice %d/%d finished in state '%s' — continuing to next slice.",
+                idx,
+                total_slices,
+                result.state,
+            )
+
+    # ---- Aggregated summary ----
+    sweep_elapsed = time.monotonic() - sweep_start
+    _LOGGER.info(
+        "\n%s\n  SWEEP %s\n  Completed: %d/%d slices in %.1fs\n%s",
+        "=" * 60,
+        "INTERRUPTED" if interrupted else "COMPLETE",
+        len(completed_run_ids),
+        total_slices,
+        sweep_elapsed,
+        "=" * 60,
+    )
+
+    # ---- Export gems across all completed slices ----
+    if completed_run_ids:
+        _LOGGER.info("Exporting gems from %d completed run(s)...", len(completed_run_ids))
+        total_gems = 0
+        if export_path is not None:
+            with open(export_path, "w", encoding="utf-8") as fh:
+                for rid in completed_run_ids:
+                    total_gems += write_gems(
+                        catalog, fh, run_id=rid, format=export_format
+                    )
+            _LOGGER.info(
+                "Exported %d gem(s) to %s.", total_gems, export_path
+            )
+        else:
+            for rid in completed_run_ids:
+                total_gems += write_gems(
+                    catalog, sys.stdout, run_id=rid, format=export_format
+                )
+            _LOGGER.info("Exported %d gem(s) to stdout.", total_gems)
+    else:
+        _LOGGER.info("No completed runs — nothing to export.")
+
+    if interrupted:
+        _LOGGER.info(
+            "Sweep was interrupted. Re-run with --resume to continue "
+            "from where it left off."
+        )
+        return 130
+    return 0
+
+
 def _monitor_run(
     coordinator: PipelineCoordinator,
     run_id: str,
@@ -558,6 +880,8 @@ def main(argv: Sequence[str] | None = None) -> int:
                     stages,
                     sweep=args.sweep,
                     ramanujan_search_specs=ramanujan_search_specs,
+                    start_sequence_id=args.start_id,
+                    end_sequence_id=args.end_id,
                 )
                 planned = coordinator.plan(spec)
                 _LOGGER.info("Planned run %s for snapshot %s.", planned, args.snapshot)
@@ -596,6 +920,13 @@ def main(argv: Sequence[str] | None = None) -> int:
             if args.command == "report":
                 _print_report(args.run_id, catalog)
                 return 0
+
+            if args.command == "sweep":
+                try:
+                    return _cmd_sweep(args, catalog, term_store)
+                except KeyboardInterrupt:
+                    _LOGGER.warning("Sweep interrupted by user.")
+                    return 130
 
             parser.error(f"unsupported command: {args.command}")
     except (XRayError, OSError, ValueError) as exc:

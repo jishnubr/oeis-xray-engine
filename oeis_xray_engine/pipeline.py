@@ -84,6 +84,8 @@ class PipelineSpec:
     lease_seconds: int = 900
     max_attempts: int = 3
     code_revision: str = "working-tree"
+    start_sequence_id: str | None = None
+    end_sequence_id: str | None = None
 
     def __post_init__(self) -> None:
         if not self.run_id or not self.snapshot_id:
@@ -101,6 +103,22 @@ class PipelineSpec:
             raise ValueError("lease_seconds must be a positive integer")
         if type(self.max_attempts) is not int or self.max_attempts <= 0:
             raise ValueError("max_attempts must be a positive integer")
+        if self.start_sequence_id is not None and not isinstance(
+            self.start_sequence_id, str
+        ):
+            raise ValueError("start_sequence_id must be a string or None")
+        if self.end_sequence_id is not None and not isinstance(
+            self.end_sequence_id, str
+        ):
+            raise ValueError("end_sequence_id must be a string or None")
+        if (
+            self.start_sequence_id is not None
+            and self.end_sequence_id is not None
+            and self.start_sequence_id > self.end_sequence_id
+        ):
+            raise ValueError(
+                "start_sequence_id cannot be greater than end_sequence_id"
+            )
         if "transform" in self.stages and not self.transform_specs:
             raise ValueError("transform stage requires at least one TransformSpec")
         if "fingerprint" in self.stages and not self.fingerprint_profiles:
@@ -696,8 +714,13 @@ class PipelineCoordinator:
         return result
 
     def _sequence_tasks(self, spec: PipelineSpec) -> Iterable[TaskManifest]:
+        partition = Partition(
+            page_size=spec.page_size,
+            start_sequence_id=spec.start_sequence_id,
+            end_sequence_id=spec.end_sequence_id,
+        )
         for descriptor in self.sequence_index.iter_sequences(
-            spec.snapshot_id, Partition(page_size=spec.page_size)
+            spec.snapshot_id, partition
         ):
             if descriptor.parse_status == "invalid":
                 continue
@@ -716,11 +739,40 @@ class PipelineCoordinator:
                         1,
                     ).value_at(0)
                     inverse_euler_eligible = first_term == 1
+            denumerant_eligible: bool | None = None
+            if "transform" in spec.stages and any(
+                transform.name == "denumerant"
+                for transform in spec.transform_specs
+            ):
+                if descriptor.term_count is not None and descriptor.term_count < 15:
+                    denumerant_eligible = False
+                else:
+                    sample_len = min(descriptor.term_count or 100, 100)
+                    terms_sample = self.term_store.read_range(
+                        descriptor.ref,
+                        0,
+                        sample_len,
+                    )
+                    first_one_pos = None
+                    for idx in range(len(terms_sample)):
+                        if terms_sample.value_at(idx) == 1:
+                            first_one_pos = idx
+                            break
+                    if first_one_pos is None:
+                        denumerant_eligible = False
+                    else:
+                        total_terms = descriptor.term_count or len(terms_sample)
+                        denumerant_eligible = (total_terms - first_one_pos) >= 15
             if "transform" in spec.stages:
                 for transform in spec.transform_specs:
                     if (
                         transform.name == "inverse_euler"
                         and not inverse_euler_eligible
+                    ):
+                        continue
+                    if (
+                        transform.name == "denumerant"
+                        and not denumerant_eligible
                     ):
                         continue
                     transformer_reference = self.transformer_registry.worker_reference(
@@ -2237,6 +2289,8 @@ def _spec_to_json(spec: PipelineSpec) -> dict[str, object]:
         "lease_seconds": spec.lease_seconds,
         "max_attempts": spec.max_attempts,
         "code_revision": spec.code_revision,
+        "start_sequence_id": spec.start_sequence_id,
+        "end_sequence_id": spec.end_sequence_id,
     }
 
 
@@ -2268,6 +2322,16 @@ def _spec_from_json(value: object) -> PipelineSpec:
         lease_seconds=int(value["lease_seconds"]),
         max_attempts=int(value["max_attempts"]),
         code_revision=str(value["code_revision"]),
+        start_sequence_id=(
+            str(value["start_sequence_id"])
+            if value.get("start_sequence_id") is not None
+            else None
+        ),
+        end_sequence_id=(
+            str(value["end_sequence_id"])
+            if value.get("end_sequence_id") is not None
+            else None
+        ),
     )
 
 

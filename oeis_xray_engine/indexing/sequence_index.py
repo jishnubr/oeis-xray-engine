@@ -52,10 +52,28 @@ class Partition:
 
     page_size: int = 500
     after_sequence_id: str | None = None
+    start_sequence_id: str | None = None
+    end_sequence_id: str | None = None
 
     def __post_init__(self) -> None:
         if type(self.page_size) is not int or self.page_size <= 0:
             raise ValueError("page_size must be a positive integer")
+        if self.start_sequence_id is not None and not isinstance(
+            self.start_sequence_id, str
+        ):
+            raise ValueError("start_sequence_id must be a string or None")
+        if self.end_sequence_id is not None and not isinstance(
+            self.end_sequence_id, str
+        ):
+            raise ValueError("end_sequence_id must be a string or None")
+        if (
+            self.start_sequence_id is not None
+            and self.end_sequence_id is not None
+            and self.start_sequence_id > self.end_sequence_id
+        ):
+            raise ValueError(
+                "start_sequence_id cannot be greater than end_sequence_id"
+            )
 
 
 @dataclass(slots=True)
@@ -206,35 +224,40 @@ class SequenceIndex:
             raise ValueError("snapshot_id must be non-empty")
         page = partition or Partition(page_size=self.page_size)
         last_id = page.after_sequence_id
+        first_page = True
         while True:
-            if last_id is None:
-                rows = self.catalog.fetch_all(
-                    """
-                    SELECT s.sequence_id, r.revision_id, r.snapshot_id, r.offset,
-                           r.term_count, r.known_end_index, r.completeness,
-                           r.term_digest, r.source_digest, r.parse_status
-                    FROM sequence_revision AS r
-                    JOIN sequence AS s ON s.sequence_id = r.sequence_id
-                    WHERE r.snapshot_id = ?
-                    ORDER BY s.sequence_id
-                    LIMIT ?
-                    """,
-                    (snapshot_id, page.page_size),
-                )
+            conditions = ["r.snapshot_id = ?"]
+            params: list[object] = [snapshot_id]
+
+            if first_page:
+                if page.after_sequence_id is not None:
+                    conditions.append("s.sequence_id > ?")
+                    params.append(page.after_sequence_id)
+                elif page.start_sequence_id is not None:
+                    conditions.append("s.sequence_id >= ?")
+                    params.append(page.start_sequence_id)
             else:
-                rows = self.catalog.fetch_all(
-                    """
-                    SELECT s.sequence_id, r.revision_id, r.snapshot_id, r.offset,
-                           r.term_count, r.known_end_index, r.completeness,
-                           r.term_digest, r.source_digest, r.parse_status
-                    FROM sequence_revision AS r
-                    JOIN sequence AS s ON s.sequence_id = r.sequence_id
-                    WHERE r.snapshot_id = ? AND s.sequence_id > ?
-                    ORDER BY s.sequence_id
-                    LIMIT ?
-                    """,
-                    (snapshot_id, last_id, page.page_size),
-                )
+                conditions.append("s.sequence_id > ?")
+                params.append(last_id)
+
+            if page.end_sequence_id is not None:
+                conditions.append("s.sequence_id <= ?")
+                params.append(page.end_sequence_id)
+
+            where_clause = " AND ".join(conditions)
+            query = f"""
+                SELECT s.sequence_id, r.revision_id, r.snapshot_id, r.offset,
+                       r.term_count, r.known_end_index, r.completeness,
+                       r.term_digest, r.source_digest, r.parse_status
+                FROM sequence_revision AS r
+                JOIN sequence AS s ON s.sequence_id = r.sequence_id
+                WHERE {where_clause}
+                ORDER BY s.sequence_id
+                LIMIT ?
+            """
+            params.append(page.page_size)
+            rows = self.catalog.fetch_all(query, tuple(params))
+            first_page = False
             if not rows:
                 return
             for row in rows:

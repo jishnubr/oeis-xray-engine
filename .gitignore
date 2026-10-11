@@ -1,15 +1,51 @@
+# ── Python ──────────────────────────────────────────────────────────────────
 __pycache__/
 *.py[cod]
-.pytest_cache/
-.coverage
-htmlcov/
-build/
-dist/
-*.egg-info/
+*.pyo
+*.pyd
+.Python
+
+# ── Virtual environments ────────────────────────────────────────────────────
 .venv/
 venv/
 env/
+ENV/
+
+# ── Build / packaging ───────────────────────────────────────────────────────
+build/
+dist/
+*.egg-info/
+*.egg
+MANIFEST
+pip-wheel-metadata/
+
+# ── Testing & coverage ──────────────────────────────────────────────────────
+.pytest_cache/
+.coverage
+.coverage.*
+htmlcov/
+
+# ── Type checkers / linters ─────────────────────────────────────────────────
+.mypy_cache/
+.dmypy.json
+.ruff_cache/
+
+# ── IDEs ────────────────────────────────────────────────────────────────────
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# ── JVM crash dumps (from Java-backed tools) ────────────────────────────────
+hs_err_pid*.log
+replay_pid*.log
+
+# ── Databases & runtime data ────────────────────────────────────────────────
 *.sqlite
 *.sqlite3
 *.db
 oeis_xray_terms/
+
+# ── OS noise ────────────────────────────────────────────────────────────────
+.DS_Store
+Thumbs.db
